@@ -181,3 +181,5 @@ cython_debug/
 .cursorindexingignore
 CERT_dataset/
 myenv/
+*.csv
+*.parquet
