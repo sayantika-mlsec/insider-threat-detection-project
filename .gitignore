@@ -186,3 +186,4 @@ myenv/
 *.parquet
 *.pkl
 message.txt
+archive/

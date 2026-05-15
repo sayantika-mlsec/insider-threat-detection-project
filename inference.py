@@ -1,119 +1,302 @@
 import pandas as pd
 import numpy as np
 import logging
-import joblib
 import shap
 from pathlib import Path
-from sklearn.ensemble import IsolationForest
 
-# Configure standard logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-def run_daily_inference(input_parquet_path: str, model_path: str, output_dir: str):
+from src.detector import InsiderThreatDetector
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHAP helper — loops over all trained features instead of hardcoding 3 names
+# ──────────────────────────────────────────────────────────────────────────────
+def _compute_shap_columns(
+    model_pipeline,
+    X: pd.DataFrame,
+    feature_cols: list,
+) -> pd.DataFrame:
     """
-    Executes the ML inference pipeline: anomaly scoring + SHAP explanations.
-    """
-    logging.info(f"Starting ML Inference Pipeline...")
-    logging.info(f"Reading target features from: {input_parquet_path}")
+    Runs TreeExplainer on the IsolationForest inside the sklearn Pipeline.
+    Returns a DataFrame of per-feature SHAP columns named shap_<feature>.
 
-    # =====================================================================
-    # 1. LOAD DATA & VALIDATE
-    # =====================================================================
+    Uses the *trained* model extracted from the pipeline — not a fresh one.
+    SHAP values indicate how much each feature pushed a sample toward anomaly.
+    Positive SHAP = feature increased anomaly score = increased risk.
+    """
+    logging.info("[SHAP] Computing feature attributions via TreeExplainer...")
+
+    # Extract the fitted IsolationForest step from inside the sklearn Pipeline
+    iso_step = model_pipeline.named_steps["detector"]
+
     try:
-        df_raw = pd.read_parquet(input_parquet_path)
-    except FileNotFoundError:
-        logging.error("DuckDB feature matrix not found. Run extraction first.")
-        raise
+        explainer = shap.TreeExplainer(iso_step)
+        # Transform X through the pipeline's pre-processing steps (imputer + scaler)
+        # but stop before the final estimator — SHAP sees the same scaled space
+        # the model was trained on, which is required for correct attributions.
+        X_transformed = model_pipeline[:-1].transform(X)
+        shap_values = explainer.shap_values(X_transformed)
+    except Exception as e:
+        logging.warning(
+            f"[SHAP] TreeExplainer failed ({e}). "
+            "Returning zero SHAP columns. Non-fatal — dashboard will show zeros."
+        )
+        shap_values = np.zeros((len(X), len(feature_cols)))
 
-    # For inference, we separate the metadata (Index) from the mathematical features
-    # df_raw index is currently MultiIndex: ['user', 'activity_date']
-    df_features = df_raw.copy()
-
-    # The features we want the model to actually evaluate
-    target_columns = [
-        'total_events', 'off_hours_ratio', 'unique_systems_accessed', 
-        'failed_login_ratio', 'active_orphan_sessions'
-    ]
-    
-    # Ensure all target columns exist (handling the NaN schema alignment)
-    X = df_features[target_columns].fillna(0) # Zero imputation for missing daily data
-
-    # =====================================================================
-    # 2. MODEL INFERENCE (Anomaly Scoring)
-    # =====================================================================
-    # In a true production environment, you would load your saved .pkl model here:
-    # detector = InsiderThreatDetector.load(model_path)
-    # df_scores = detector.predict_live_traffic(df_features)
-    
-    # For this MVP to run instantly, we will initialize and fit a fresh model 
-    # directly on the incoming data stream to act as a dynamic baseline.
-    logging.info("Initializing dynamic Isolation Forest baseline...")
-    
-    iso_forest = IsolationForest(
-        n_estimators=150, 
-        contamination=0.05, # Assuming top 5% of daily activity is highly anomalous
-        random_state=42
+    shap_df = pd.DataFrame(
+        shap_values,
+        index=X.index,
+        columns=[f"shap_{col}" for col in feature_cols],
     )
-    
-    iso_forest.fit(X)
-    
-    # decision_function returns negative values for anomalies, positive for normal.
-    # We invert it (multiply by -1) and scale it so 0 = Normal, 1.0 = Critical Threat.
-    # This makes it readable for the SOC Dashboard.
-    raw_scores = iso_forest.decision_function(X)
-    normalized_risk = (raw_scores.max() - raw_scores) / (raw_scores.max() - raw_scores.min())
-    
-    df_features['risk_score'] = normalized_risk
+    logging.info(f"[SHAP] Done. Columns generated: {list(shap_df.columns)}")
+    return shap_df
 
-    # =====================================================================
-    # 3. EXPLAINABLE AI (SHAP)
-    # =====================================================================
-    logging.info("Calculating SHAP Feature Attributions...")
-    
-    # SHAP TreeExplainer is heavily optimized for Isolation Forests
-    explainer = shap.TreeExplainer(iso_forest)
-    shap_values = explainer.shap_values(X)
-    
-    # IsolationForest SHAP values are structured slightly differently.
-    # We want to know how much each feature pushed the user TOWARDS an anomaly.
-    # We append these SHAP values directly back into the dataframe.
-    df_features['shap_off_hours'] = shap_values[:, X.columns.get_loc('off_hours_ratio')]
-    df_features['shap_orphans'] = shap_values[:, X.columns.get_loc('active_orphan_sessions')]
-    df_features['shap_failed_logins'] = shap_values[:, X.columns.get_loc('failed_login_ratio')]
 
-    # =====================================================================
-    # 4. DATA FUSION & TELEMETRY CHECKS
-    # =====================================================================
-    logging.info("Applying Data Quality Fusion rules...")
-    
-    # Check for missing telemetry (the NaN audit we discussed earlier)
-    # If a user has 0 total_events but is in the system, logs might be severed
-    df_features['data_quality_risk'] = np.where(df_features['total_events'] == 0, 1, 0)
+# ──────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+def run_daily_inference(
+    input_parquet_path: str,
+    model_path: str,
+    output_dir: str,
+) -> str:
+    """
+    Executes the production ML inference pipeline.
 
-    # =====================================================================
-    # 5. EXPORT FOR DASHBOARD
-    # =====================================================================
-    out_path = Path(output_dir)
+    Steps
+    -----
+    1. Load the trained InsiderThreatDetector (.pkl serialised by fit_baseline).
+    2. Run predict_live_traffic() — dual-model MAD + Isolation Forest scoring.
+    3. Compute SHAP attributions from the *locked* trained model.
+    4. Compute calibrated risk_score from training percentile distribution (C2 fix).
+    5. Merge scores + SHAP + raw features into one flat DataFrame.
+    6. Write scored_features_latest.parquet for the Streamlit dashboard.
+
+    Parameters
+    ----------
+    input_parquet_path : str
+        Path to the fused feature matrix produced by fuse_feature_matrices().
+        Expected index: MultiIndex ['user', 'activity_date'].
+    model_path : str
+        Path to the .pkl produced by InsiderThreatDetector.fit_baseline().
+    output_dir : str
+        Directory where scored_features_latest.parquet is written.
+
+    Returns
+    -------
+    str
+        Absolute path to the output parquet.
+    """
+    logging.info("=" * 70)
+    logging.info("PRODUCTION INFERENCE PIPELINE — START")
+    logging.info(f"  features : {input_parquet_path}")
+    logging.info(f"  model    : {model_path}")
+    logging.info(f"  output   : {output_dir}")
+    logging.info("=" * 70)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 1 — Load the trained detector
+    # ──────────────────────────────────────────────────────────────────────
+    # InsiderThreatDetector.load() validates:
+    #   • is_fitted == True  (not a newly initialised, untrained object)
+    #   • baseline_stats non-empty  (MAD model has data)
+    #   • object type is InsiderThreatDetector  (wrong pkl caught)
+    # Raises before touching any live data if any check fails.
+    detector = InsiderThreatDetector.load(model_path)
+    logging.info(
+        f"[inference] Detector loaded | "
+        f"version={detector.model_version} | "
+        f"features={list(detector.baseline_stats.keys())}"
+    )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 2 — Dual-model scoring via predict_live_traffic()
+    # ──────────────────────────────────────────────────────────────────────
+    # predict_live_traffic() returns df_scores (index = user), containing:
+    #
+    #   data_quality_risk    — 1 if >20% of features are NaN (telemetry gap IOC)
+    #   mad_score_count      — how many features exceeded the MAD threshold
+    #   mad_critical_flag    — 1 if >= 2 features exceeded MAD threshold
+    #   iso_forest_raw_score — continuous score from the trained Isolation Forest
+    #   iso_forest_flag      — 1 if score < auto-derived training threshold
+    #   confirmed_threat     — both models agree AND data is clean
+    #   high_risk_review     — both models agree BUT data is suspicious
+    #   data_loss_ioc        — data quality alone is suspicious (no model signal)
+    #
+    # predict_live_traffic() does NOT mutate the raw feature DataFrame.
+    df_scores = detector.predict_live_traffic(input_parquet_path)
+    logging.info(
+        f"[inference] Scoring complete | "
+        f"rows={len(df_scores)} | "
+        f"confirmed_threats={df_scores['confirmed_threat'].sum()} | "
+        f"high_risk_reviews={df_scores['high_risk_review'].sum()} | "
+        f"data_loss_iocs={df_scores['data_loss_ioc'].sum()}"
+    )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 3 — Reload raw features for downstream merge
+    # ──────────────────────────────────────────────────────────────────────
+    # predict_live_traffic() intentionally returns ONLY scores (immutable
+    # design). We reload the features here for the dashboard merge.
+    df_raw = pd.read_parquet(input_parquet_path)
+    if "user" in df_raw.index.names:
+        df_raw = df_raw.reset_index()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 4 — SHAP attributions from the LOCKED trained model
+    # ──────────────────────────────────────────────────────────────────────
+    # Critical: we score SHAP against detector.iso_pipeline (the trained
+    # pipeline), NOT a freshly fit model. This guarantees:
+    #   • Explanations reflect what the deployed model learned from history.
+    #   • SHAP values are consistent and comparable across daily batches.
+    #   • No new model is ever fit on live data during inference.
+    feature_cols = list(detector.baseline_stats.keys())
+
+    # Build the feature matrix identically to how predict_live_traffic does it
+    df_for_shap = df_raw.copy()
+    if "user" in df_for_shap.columns:
+        df_for_shap = df_for_shap.set_index("user")
+    X_live = (
+        df_for_shap
+        .select_dtypes(include=[np.number])
+        [feature_cols]
+        .fillna(0)
+    )
+
+    shap_df = _compute_shap_columns(
+        model_pipeline=detector.iso_pipeline,
+        X=X_live,
+        feature_cols=feature_cols,
+    )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 5 — Calibrated risk_score from training score distribution
+    # ──────────────────────────────────────────────────────────────────────
+    # C2 fix: risk_score is a PERCENTILE on the TRAINING score distribution,
+    # not a batch-relative normalisation.
+    #
+    #   risk_score = 0.95  →  more anomalous than 95% of training-era users
+    #   risk_score = 0.50  →  median normality
+    #   risk_score = 0.10  →  clearly normal
+    #
+    # This makes the 0.75 critical threshold STABLE and MEANINGFUL across
+    # batches. A boring day will NOT auto-produce a user with risk_score=1.0.
+    #
+    # Requires detector.train_score_percentiles (stored by fit_baseline after
+    # this fix is applied). For models trained before this fix, falls back
+    # to a safe batch-relative method with an explicit warning to retrain.
+    raw_scores = df_scores["iso_forest_raw_score"].values
+
+    if hasattr(detector, "train_score_percentiles"):
+        # Empirical CDF: map each live score to its percentile on training scores.
+        # ISO scores: higher = more normal → we invert so higher percentile = more risk.
+        percentiles = np.sort(np.array(detector.train_score_percentiles))
+        n = len(percentiles)
+        # For each live score, find what fraction of training scores are HIGHER (more normal)
+        # i.e., how anomalous is this score relative to training?
+        risk_score = np.array([
+            float(np.searchsorted(percentiles, s, side='right')) / n
+            for s in raw_scores
+        ])
+        # Invert: low iso score (anomalous) → high percentile rank → high risk
+        risk_score = 1.0 - risk_score
+        risk_score = np.clip(risk_score, 0.0, 1.0)
+        logging.info(
+            "[inference] risk_score calibrated against training percentiles. "
+            f"Range: [{risk_score.min():.3f}, {risk_score.max():.3f}]"
+        )
+    else:
+        logging.warning(
+            "[inference] train_score_percentiles not found on loaded model. "
+            "This model was trained before the C2 calibration fix. "
+            "Falling back to batch-relative normalisation. "
+            "Retrain with updated fit_baseline() to resolve this."
+        )
+        score_range = raw_scores.max() - raw_scores.min()
+        if score_range == 0:
+            logging.warning(
+                "[inference] All ISO scores identical — "
+                "degenerate batch. risk_score set to 0.5 for all users."
+            )
+            risk_score = np.full(len(raw_scores), 0.5)
+        else:
+            risk_score = (raw_scores.max() - raw_scores) / score_range
+
+    df_scores["risk_score"] = risk_score
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 6 — Merge scores + SHAP + raw features into one flat DataFrame
+    # ──────────────────────────────────────────────────────────────────────
+    # Layout after predict_live_traffic:
+    #   df_scores : index = user (non-unique — one row per user-day)
+    #   shap_df   : index = user (row-aligned with df_scores)
+    #   df_raw    : columns include 'user', 'activity_date', raw features
+    #
+    # We join scores and SHAP first (both indexed by user, row-aligned),
+    # then attach activity_date + raw features positionally. Positional
+    # concat is safe here because all three DataFrames originate from the
+    # same parquet in the same row order.
+
+    df_scores = df_scores.join(shap_df, how="left")
+    df_scores = df_scores.reset_index()
+    # After reset_index, the user index becomes a column named 'user'
+    if "index" in df_scores.columns:
+        df_scores.rename(columns={"index": "user"}, inplace=True)
+
+    feature_passthrough = ["activity_date"] + feature_cols
+    available_cols = [c for c in feature_passthrough if c in df_raw.columns]
+
+    df_raw_reset = df_raw.reset_index(drop=True)
+    df_scores_reset = df_scores.reset_index(drop=True)
+
+    df_final = pd.concat(
+        [df_scores_reset, df_raw_reset[available_cols]],
+        axis=1
+    )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STEP 7 — Export for dashboard
+    # ──────────────────────────────────────────────────────────────────────
+    out_path = Path(output_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
-    
     final_output_file = out_path / "scored_features_latest.parquet"
-    
-    # Save the fully scored dataframe (including the index)
-    df_features.to_parquet(final_output_file, index=True)
-    
-    logging.info(f"Pipeline Complete. Scored data written to: {final_output_file}")
-    
-    # Print a quick summary to the console
-    critical_count = len(df_features[df_features['risk_score'] > 0.75])
-    logging.info(f"Found {critical_count} critical anomalies in this batch.")
 
+    df_final.to_parquet(final_output_file, index=False)
+    logging.info(f"[inference] Output written → {final_output_file}")
+
+    # Operator summary
+    critical_count  = int((df_final["risk_score"] > 0.75).sum())
+    confirmed       = int(df_final["confirmed_threat"].sum())
+    review          = int(df_final["high_risk_review"].sum())
+    ioc             = int(df_final["data_loss_ioc"].sum())
+
+    logging.info("=" * 70)
+    logging.info("INFERENCE SUMMARY")
+    logging.info(f"  User-days scored                              : {len(df_final)}")
+    logging.info(f"  risk_score > 0.75 (calibrated percentile)    : {critical_count}")
+    logging.info(f"  confirmed_threat  (both models + clean data)  : {confirmed}")
+    logging.info(f"  high_risk_review  (both models + dirty data)  : {review}")
+    logging.info(f"  data_loss_ioc     (telemetry gap only)        : {ioc}")
+    logging.info("=" * 70)
+
+    return str(final_output_file)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # input_parquet_path — the fused live feature matrix from fuse_feature_matrices()
+    # model_path         — the .pkl saved by fit_baseline()
+    # Update both paths to match your most recent run before executing.
     run_daily_inference(
-        # Point this to the 'live' test file DuckDB just generated
-        input_parquet_path="features/live_traffic_test_20260503_002624.parquet", 
-        
-        # Point this to your saved model from the fit_baseline step
-        model_path="iso_pipeline_v20260503_003905.pkl",                 
-        
-        output_dir="features/"                                       
+        input_parquet_path="features/master_features_unscored_live.parquet",
+        model_path="iso_pipeline_v20260503_003905.pkl",
+        output_dir="features/",
     )
