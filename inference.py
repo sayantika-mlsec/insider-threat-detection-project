@@ -160,8 +160,12 @@ def run_daily_inference(
 
     # Build the feature matrix identically to how predict_live_traffic does it
     df_for_shap = df_raw.copy()
-    if "user" in df_for_shap.columns:
-        df_for_shap = df_for_shap.set_index("user")
+    # H8: build the same (user, activity_date) MultiIndex the detector uses internally,
+    # so shap_df aligns with df_scores for the .join() below.
+    if list(df_for_shap.index.names) != ["user", "activity_date"]:
+        if "user" in df_for_shap.index.names:
+            df_for_shap = df_for_shap.reset_index()
+    df_for_shap = df_for_shap.set_index(["user", "activity_date"])
     X_live = (
         df_for_shap
         .select_dtypes(include=[np.number])
@@ -233,33 +237,20 @@ def run_daily_inference(
     # ──────────────────────────────────────────────────────────────────────
     # STEP 6 — Merge scores + SHAP + raw features into one flat DataFrame
     # ──────────────────────────────────────────────────────────────────────
-    # Layout after predict_live_traffic:
-    #   df_scores : index = user (non-unique — one row per user-day)
-    #   shap_df   : index = user (row-aligned with df_scores)
-    #   df_raw    : columns include 'user', 'activity_date', raw features
-    #
-    # We join scores and SHAP first (both indexed by user, row-aligned),
-    # then attach activity_date + raw features positionally. Positional
-    # concat is safe here because all three DataFrames originate from the
-    # same parquet in the same row order.
-
+    # H8: df_scores is now indexed by (user, activity_date), as is shap_df.
+    # Join everything ON the MultiIndex — safe, deterministic, no duplicate cols.
     df_scores = df_scores.join(shap_df, how="left")
-    df_scores = df_scores.reset_index()
-    # After reset_index, the user index becomes a column named 'user'
-    if "index" in df_scores.columns:
-        df_scores.rename(columns={"index": "user"}, inplace=True)
 
-    feature_passthrough = ["activity_date"] + feature_cols
-    available_cols = [c for c in feature_passthrough if c in df_raw.columns]
+    # Attach raw features (already indexed by (user, activity_date) from
+    # fuse_feature_matrices). Index alignment guarantees correct row matching
+    # regardless of row order in the source parquets.
+    df_raw_indexed = df_for_shap[[c for c in feature_cols if c in df_for_shap.columns]]
+    df_final = df_scores.join(df_raw_indexed, how="left")
 
-    df_raw_reset = df_raw.reset_index(drop=True)
-    df_scores_reset = df_scores.reset_index(drop=True)
+    # Reset index so user and activity_date become plain columns for the parquet
+    df_final = df_final.reset_index()
 
-    df_final = pd.concat(
-        [df_scores_reset, df_raw_reset[available_cols]],
-        axis=1
-    )
-
+    
     # ──────────────────────────────────────────────────────────────────────
     # STEP 7 — Export for dashboard
     # ──────────────────────────────────────────────────────────────────────
@@ -296,7 +287,7 @@ if __name__ == "__main__":
     # model_path         — the .pkl saved by fit_baseline()
     # Update both paths to match your most recent run before executing.
     run_daily_inference(
-        input_parquet_path="features/master_features_unscored_live.parquet",
-        model_path="iso_pipeline_v20260503_003905.pkl",
+        input_parquet_path="features/master_features_unscored_20260515_211015.parquet",
+        model_path="iso_pipeline_v20260515_211112.pkl",
         output_dir="features/",
     )
