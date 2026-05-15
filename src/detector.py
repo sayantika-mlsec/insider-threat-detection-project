@@ -59,11 +59,17 @@ class InsiderThreatDetector:
         makes the "one row = one user-day" semantics explicit.
     """
 
-    def __init__(self, mad_threshold: float = 3.5, missing_data_tolerance: float = 0.2):
+    def __init__(
+            self, 
+            mad_threshold: float = 3.5, 
+            missing_data_tolerance: float = 0.2,
+            iso_flag_percentile: float = 1.0   # Bottom 1% of training score
+    ):
         self.mad_threshold = mad_threshold
         self.missing_data_tolerance = missing_data_tolerance
+        self.iso_flag_percentile = iso_flag_percentile
 
-        # H2: contamination='auto' — see class docstring for justification
+        # contamination='auto' — see class docstring for justification
         self.iso_pipeline = Pipeline([
             ('imputer',  SimpleImputer(strategy='constant', fill_value=0)),
             ('scaler',   RobustScaler()),
@@ -238,7 +244,8 @@ class InsiderThreatDetector:
         for col in numeric_cols:
             col_median = df_features[col].median(skipna=True)
             col_mad    = median_abs_deviation(df_features[col].dropna(), scale='normal')
-            self.baseline_stats[col] = {'median': col_median, 'mad': col_mad}
+            col_p95    = df_features[col].quantile(0.95)   # NEW
+            self.baseline_stats[col] = {'median': col_median, 'mad': col_mad, 'p95': col_p95}
 
         zero_mad_cols = [c for c, v in self.baseline_stats.items() if v['mad'] == 0]
         logging.info(
@@ -247,19 +254,25 @@ class InsiderThreatDetector:
         )
 
         # ── 2. Isolation Forest (Model 2) ───────────────────────────────
-        self.iso_pipeline.fit(df_features[numeric_cols])
-        self.is_fitted = True
+        self.iso_pipeline.fit(df_features[numeric_cols])      
+        self.is_fitted = True                               
 
-        # Auto-derive ISO threshold from training distribution
+        # Auto-derive ISO threshold from training distribution.
+        # Was `mean - 1*std`, which flagged ~14% of training data — far too
+        # noisy. Switched to a percentile cut (bottom 1% by default).
+        # CERT r4.2 base rate is ~0.02% truly malicious, but the model also
+        # flags legitimate-but-unusual behavior, so 1% leaves analyst
+        # headroom without drowning the queue. Tune via the
+        # `iso_flag_percentile` constructor arg.
         train_scores = self.iso_pipeline.decision_function(df_features[numeric_cols])
-        self.iso_threshold = float(np.mean(train_scores) - np.std(train_scores))
+        self.iso_threshold = float(np.percentile(train_scores, self.iso_flag_percentile))
         logging.info(
-            f"[fit_baseline] ISO threshold auto-derived | "
-            f"mean={np.mean(train_scores):.4f} | std={np.std(train_scores):.4f} | "
-            f"threshold={self.iso_threshold:.4f}"
+            f"[fit_baseline] ISO threshold (percentile={self.iso_flag_percentile}) | "
+            f"threshold={self.iso_threshold:.4f} | "
+            f"score_range=[{train_scores.min():.4f}, {train_scores.max():.4f}]"
         )
 
-        # store training score percentiles for inference calibration ──
+        # ── C2: store training score percentiles for inference calibration ──   ← MISSING in your version
         quantile_points = np.linspace(0, 1, 1000)
         self.train_score_percentiles = list(
             np.quantile(train_scores, quantile_points).astype(float)
@@ -280,7 +293,7 @@ class InsiderThreatDetector:
             f"path={export_path} | features={list(self.baseline_stats.keys())}"
         )
         return export_path
-
+        
     # ────────────────────────────────────────────────────────────────────
     # INFERENCE
     # ────────────────────────────────────────────────────────────────────
@@ -358,19 +371,30 @@ class InsiderThreatDetector:
             live_values = df_for_mad[col]
 
             if hist_mad == 0:
-                # Iglewicz-Hoaglin can't compute z when MAD=0; we still
-                # want to flag values strictly above the training median.
-                # Constant 10.0 is a sentinel z-score that exceeds any
-                # realistic mad_threshold (default 3.5).
-                z_scores = np.where(live_values > hist_median, 10.0, 0.0)
+                # MAD collapsed because >50% of training values equal the median.
+                # But the feature may still have an informative non-zero tail.
+                # Fall back to a percentile-based dispersion: the distance from the
+                # median to the 95th percentile. If THAT is also 0, the feature is
+                # genuinely constant and we abstain.
+                hist_p95 = self.baseline_stats[col].get('p95', hist_median)
+                fallback_scale = hist_p95 - hist_median
+                if fallback_scale == 0:
+                    # Genuinely constant feature (e.g. keyword_match_indicator,
+                    # 100% zero in training) — no signal, abstain.
+                    z_scores = np.zeros(len(live_values))
+                else:
+                    # Zero-inflated but informative (e.g. off_hours_ratio).
+                    # Score live values by how far they exceed the normal envelope.
+                    z_scores = np.clip(
+                        (live_values - hist_median) / fallback_scale, 0, None
+                    ) * self.mad_threshold  # scale so the threshold comparison is meaningful
             else:
-                # Modified z-score (Iglewicz-Hoaglin): 0.6745 = phi^-1(0.75)
                 z_scores = np.abs(0.6745 * (live_values - hist_median) / hist_mad)
 
             mad_flags_matrix[f'{col}_flag'] = np.where(z_scores > self.mad_threshold, 1, 0)
 
         df_scores['mad_score_count']   = mad_flags_matrix.sum(axis=1)
-        df_scores['mad_critical_flag'] = np.where(df_scores['mad_score_count'] >= 2, 1, 0)
+        df_scores['mad_critical_flag'] = np.where(df_scores['mad_score_count'] >= 3, 1, 0)
         logging.info(
             f"[predict_live_traffic] MAD scoring complete | "
             f"critical_flags={df_scores['mad_critical_flag'].sum()} | "

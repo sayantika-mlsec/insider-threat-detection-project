@@ -28,6 +28,7 @@ def fuse_feature_matrices(
     http_parquet_path: str,
     email_parquet_path: str,
     output_dir: str = "features",
+    output_prefix: str = "master_features_unscored",
 ) -> str:
     """
     Fuses three source-specific feature matrices into one master matrix.
@@ -35,6 +36,22 @@ def fuse_feature_matrices(
     All three input parquets must be indexed by ('user', 'activity_date').
     Output is also indexed by ('user', 'activity_date') and conforms to
     MASTER_FEATURE_SCHEMA.
+    Parameters
+    ----------
+    output_prefix : str
+        Filename prefix to disambiguate concurrent fusion runs. The full
+        filename becomes `{output_prefix}_{timestamp}.parquet`.
+ 
+        CRITICAL: when fusing both historical and live windows in the same
+        session, ALWAYS pass distinct prefixes (e.g. 'historical_baseline'
+        and 'live_test'). The timestamp is YYYYMMDD_HHMMSS — second-level
+        resolution — which is NOT sufficient to distinguish two calls made
+        within the same second. With the default prefix, the second call
+        will silently overwrite the first, causing train/test data leak.
+ 
+    Returns
+    -------
+    str
 
     Returns the path to the master parquet.
     """
@@ -91,7 +108,7 @@ def fuse_feature_matrices(
     out_path = Path(output_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = out_path / f"master_features_unscored_{timestamp}.parquet"
+    output_file = out_path / f"{output_prefix}_{timestamp}.parquet"
     df_fused.to_parquet(output_file, index=True)
 
     logging.info(f"Fusion Complete. | User-Days: {len(df_fused)} | Output: {output_file}")
