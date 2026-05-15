@@ -185,3 +185,4 @@ myenv/
 *.csv
 *.parquet
 *.pkl
+message.txt
