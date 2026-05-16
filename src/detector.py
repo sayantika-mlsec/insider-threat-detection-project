@@ -63,11 +63,15 @@ class InsiderThreatDetector:
             self, 
             mad_threshold: float = 3.5, 
             missing_data_tolerance: float = 0.2,
-            iso_flag_percentile: float = 1.0   # Bottom 1% of training score
+            iso_flag_percentile: float = 1.0,  # Bottom 1% of training score
+            mad_flag_percentile: float = 99.0,
+            critical_flag_ratio: float | None = None,
     ):
         self.mad_threshold = mad_threshold
         self.missing_data_tolerance = missing_data_tolerance
         self.iso_flag_percentile = iso_flag_percentile
+        self.mad_flag_percentile = mad_flag_percentile 
+        self.critical_flag_ratio = critical_flag_ratio
 
         # contamination='auto' — see class docstring for justification
         self.iso_pipeline = Pipeline([
@@ -78,8 +82,7 @@ class InsiderThreatDetector:
                 random_state=42,
                 n_estimators=100,
             )),
-        ])
-
+        ])      
         self.baseline_stats: dict = {}
         self.is_fitted: bool = False
         self.model_version: str | None = None
@@ -120,7 +123,7 @@ class InsiderThreatDetector:
                 "[load] Loaded model has empty baseline_stats. "
                 "MAD scoring will be non-functional. Retrain and re-serialize."
             )
-
+        
         logging.info(
             f"[load] Model loaded | version={obj.model_version} | "
             f"features={len(obj.baseline_stats)} | "
@@ -223,6 +226,36 @@ class InsiderThreatDetector:
             f"[{context}] Cannot construct (user, activity_date) MultiIndex. "
             f"Found columns: {list(df.columns)}, index: {df.index.names}"
         )
+    
+    # Executes the DRY (Don't Repeat Yourself) refactoring and cleanly auto-tunes the MAD threshold during training.
+    def _compute_mad_flags(self, df: pd.DataFrame, cols: list) -> pd.DataFrame:
+        """
+        Computes MAD z-scores and binary anomaly flags for numeric columns.
+        Abstracted to keep fit_baseline and predict_live_traffic DRY.
+        """
+        mad_flags_matrix = pd.DataFrame(index=df.index)
+        for col in cols:
+            if col not in self.baseline_stats:
+                continue
+            hist_median = self.baseline_stats[col]['median']
+            hist_mad    = self.baseline_stats[col]['mad']
+        
+            # Values will naturally contain NaNs where telemetry was missing
+            live_values = df[col]
+            if hist_mad == 0:
+                hist_p95 = self.baseline_stats[col].get('p95', hist_median)
+                fallback_scale = hist_p95 - hist_median
+
+                if fallback_scale == 0:
+                    z_scores = np.where(live_values.isna(), np.nan, np.where(live_values != hist_median, self.mad_threshold + 1.0, 0.0))
+                else:
+                    z_scores = np.where(live_values.isna(), np.nan, np.where(live_values > hist_p95, self.mad_threshold + 1.0, 0.0))
+            else:
+                z_scores = np.abs(0.6745 * (live_values - hist_median) / hist_mad)
+            # Generate binary flag. Pandas/Numpy evaluates (NaN > threshold) as False.
+            mad_flags_matrix[f'{col}_flag'] = np.where(z_scores > self.mad_threshold, 1, 0)
+            
+        return mad_flags_matrix
 
     # ────────────────────────────────────────────────────────────────────
     # TRAINING
@@ -240,6 +273,7 @@ class InsiderThreatDetector:
         self._validate_input(df_features.reset_index(), context="fit_baseline")
 
         # ── 1. MAD Baseline (Model 1) ───────────────────────────────────
+        train_mad_flags_matrix = pd.DataFrame(index=df_features.index)
         numeric_cols = df_features.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             col_median = df_features[col].median(skipna=True)
@@ -252,7 +286,35 @@ class InsiderThreatDetector:
             f"[fit_baseline] MAD baseline computed | "
             f"features={len(self.baseline_stats)} | zero_mad_cols={zero_mad_cols}"
         )
-
+    
+        # Auto-derive MAD critical_flag_ratio from training distribution ──
+        # Re-score the training data using the newly built baseline_stats
+        train_mad_flags_matrix = self._compute_mad_flags(df_features, numeric_cols)
+        
+        train_score_count = train_mad_flags_matrix.sum(axis=1)
+        observed_feature_count = df_features[numeric_cols].notna().sum(axis=1)
+        
+        train_flag_ratios = pd.Series(np.where(
+            observed_feature_count > 0,
+            train_score_count / observed_feature_count,
+            0.0
+        ))
+        
+        # Calculate the 99th percentile of active anomaly days, ignoring pure-zero days.
+        active_ratios = train_flag_ratios.replace(0, np.nan)
+        
+        if active_ratios.isna().all():
+            # Safe fallback if training data has literally zero MAD flags across the board
+            self.critical_flag_ratio = 0.15 
+            logging.info("[fit_baseline] No training MAD flags. critical_flag_ratio defaulted to 0.15")
+        else:
+            # Assuming a 99th percentile target for the tuning
+            self.critical_flag_ratio = float(np.nanpercentile(active_ratios, self.mad_flag_percentile))
+            logging.info(
+                f"[fit_baseline] Auto-derived critical_flag_ratio = "
+                f"{self.critical_flag_ratio:.4f} (99th percentile of non-zero days)"
+            )
+        
         # ── 2. Isolation Forest (Model 2) ───────────────────────────────
         self.iso_pipeline.fit(df_features[numeric_cols])      
         self.is_fitted = True                               
@@ -320,6 +382,10 @@ class InsiderThreatDetector:
                 "Model must be fit() before predict() is called. "
                 "Run fit_baseline() first."
             )
+        if self.critical_flag_ratio is None:
+            raise RuntimeError(
+                "critical_flag_ratio not set. Run fit_baseline() first."
+            )
 
         # Resolve threshold: caller override → auto-derived → fallback
         if iso_decision_threshold is None:
@@ -359,46 +425,33 @@ class InsiderThreatDetector:
                 f"user-days flagged for suspicious data loss."
             )
 
-        # ── MODEL 1: MAD against locked baseline ────────────────────────
-        mad_flags_matrix = pd.DataFrame(index=df_features.index)
-        df_for_mad = df_features.fillna(0)
+        # ── MAD Baseline Evaluation (Model 1) ─────────────────────────
+        # Create an isolated view; DO NOT fillna(0) to preserve true telemetry gaps
+        df_for_mad = df_features.copy()
+        numeric_cols = df_for_mad.select_dtypes(include=[np.number]).columns
+        
+        # Execute the DRY scoring logic
+        mad_flags_matrix = self._compute_mad_flags(df_for_mad, numeric_cols)
 
-        for col in self.baseline_stats.keys():
-            if col not in df_for_mad.columns:
-                continue
-            hist_median = self.baseline_stats[col]['median']
-            hist_mad    = self.baseline_stats[col]['mad']
-            live_values = df_for_mad[col]
+        # ── Dynamic Ratio Aggregation ────────────────────────────────────
+        df_scores['mad_score_count'] = mad_flags_matrix.sum(axis=1)
+        df_scores['observed_feature_count'] = df_for_mad[numeric_cols].notna().sum(axis=1)
+        
+        df_scores['mad_flag_ratio'] = np.where(
+            df_scores['observed_feature_count'] > 0,
+            df_scores['mad_score_count'] / df_scores['observed_feature_count'],
+            0.0
+        )
+        
+        # Apply the critical threshold (now safely locked from the training phase)
+        df_scores['mad_critical_flag'] = np.where(
+            df_scores['mad_flag_ratio'] >= self.critical_flag_ratio, 1, 0
+        )
 
-            if hist_mad == 0:
-                # MAD collapsed because >50% of training values equal the median.
-                # But the feature may still have an informative non-zero tail.
-                # Fall back to a percentile-based dispersion: the distance from the
-                # median to the 95th percentile. If THAT is also 0, the feature is
-                # genuinely constant and we abstain.
-                hist_p95 = self.baseline_stats[col].get('p95', hist_median)
-                fallback_scale = hist_p95 - hist_median
-                if fallback_scale == 0:
-                    # Genuinely constant feature (e.g. keyword_match_indicator,
-                    # 100% zero in training) — no signal, abstain.
-                    z_scores = np.zeros(len(live_values))
-                else:
-                    # Zero-inflated but informative (e.g. off_hours_ratio).
-                    # Score live values by how far they exceed the normal envelope.
-                    z_scores = np.clip(
-                        (live_values - hist_median) / fallback_scale, 0, None
-                    ) * self.mad_threshold  # scale so the threshold comparison is meaningful
-            else:
-                z_scores = np.abs(0.6745 * (live_values - hist_median) / hist_mad)
-
-            mad_flags_matrix[f'{col}_flag'] = np.where(z_scores > self.mad_threshold, 1, 0)
-
-        df_scores['mad_score_count']   = mad_flags_matrix.sum(axis=1)
-        df_scores['mad_critical_flag'] = np.where(df_scores['mad_score_count'] >= 3, 1, 0)
         logging.info(
             f"[predict_live_traffic] MAD scoring complete | "
             f"critical_flags={df_scores['mad_critical_flag'].sum()} | "
-            f"avg_flag_count={df_scores['mad_score_count'].mean():.2f}"
+            f"avg_flag_ratio={df_scores['mad_flag_ratio'].mean():.3f}"
         )
 
         # ── MODEL 2: Isolation Forest ───────────────────────────────────

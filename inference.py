@@ -65,6 +65,7 @@ def run_daily_inference(
     input_parquet_path: str,
     model_path: str,
     output_dir: str,
+    critical_risk_threshold: float = 0.75,  # NEW: Parameterized threshold
 ) -> str:
     """
     Executes the production ML inference pipeline.
@@ -138,36 +139,24 @@ def run_daily_inference(
         f"high_risk_reviews={df_scores['high_risk_review'].sum()} | "
         f"data_loss_iocs={df_scores['data_loss_ioc'].sum()}"
     )
-
     # ──────────────────────────────────────────────────────────────────────
-    # STEP 3 — Reload raw features for downstream merge
+    # STEP 3 & 4 — Clean Data Loading and SHAP Extraction
     # ──────────────────────────────────────────────────────────────────────
-    # predict_live_traffic() intentionally returns ONLY scores (immutable
-    # design). We reload the features here for the dashboard merge.
     df_raw = pd.read_parquet(input_parquet_path)
-    if "user" in df_raw.index.names:
-        df_raw = df_raw.reset_index()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # STEP 4 — SHAP attributions from the LOCKED trained model
-    # ──────────────────────────────────────────────────────────────────────
-    # Critical: we score SHAP against detector.iso_pipeline (the trained
-    # pipeline), NOT a freshly fit model. This guarantees:
-    #   • Explanations reflect what the deployed model learned from history.
-    #   • SHAP values are consistent and comparable across daily batches.
-    #   • No new model is ever fit on live data during inference.
+    # Enforce MultiIndex cleanly without deep-copying the dataframe
+    if list(df_raw.index.names) != ["user", "activity_date"]:
+        # If the columns exist in the index but are messy, push them to columns first
+        if any(name in ["user", "activity_date"] for name in df_raw.index.names):
+            df_raw = df_raw.reset_index()
+        # Set the definitive MultiIndex
+        df_raw = df_raw.set_index(["user", "activity_date"])
+
     feature_cols = list(detector.baseline_stats.keys())
 
-    # Build the feature matrix identically to how predict_live_traffic does it
-    df_for_shap = df_raw.copy()
-    # H8: build the same (user, activity_date) MultiIndex the detector uses internally,
-    # so shap_df aligns with df_scores for the .join() below.
-    if list(df_for_shap.index.names) != ["user", "activity_date"]:
-        if "user" in df_for_shap.index.names:
-            df_for_shap = df_for_shap.reset_index()
-    df_for_shap = df_for_shap.set_index(["user", "activity_date"])
+    # Extract numerical features for SHAP without mutating df_raw
     X_live = (
-        df_for_shap
+        df_raw
         .select_dtypes(include=[np.number])
         [feature_cols]
         .fillna(0)
@@ -237,17 +226,14 @@ def run_daily_inference(
     # ──────────────────────────────────────────────────────────────────────
     # STEP 6 — Merge scores + SHAP + raw features into one flat DataFrame
     # ──────────────────────────────────────────────────────────────────────
-    # H8: df_scores is now indexed by (user, activity_date), as is shap_df.
-    # Join everything ON the MultiIndex — safe, deterministic, no duplicate cols.
+    # Join SHAP attributions safely onto the MultiIndex
     df_scores = df_scores.join(shap_df, how="left")
 
-    # Attach raw features (already indexed by (user, activity_date) from
-    # fuse_feature_matrices). Index alignment guarantees correct row matching
-    # regardless of row order in the source parquets.
-    df_raw_indexed = df_for_shap[[c for c in feature_cols if c in df_for_shap.columns]]
+    # Attach raw features directly from the safely indexed df_raw
+    df_raw_indexed = df_raw[[c for c in feature_cols if c in df_raw.columns]]
     df_final = df_scores.join(df_raw_indexed, how="left")
 
-    # Reset index so user and activity_date become plain columns for the parquet
+    # Reset index so user and activity_date become plain columns for the parquet write
     df_final = df_final.reset_index()
 
     
@@ -262,7 +248,8 @@ def run_daily_inference(
     logging.info(f"[inference] Output written → {final_output_file}")
 
     # Operator summary
-    critical_count  = int((df_final["risk_score"] > 0.75).sum())
+    # Dynamic thresholding based on the function parameter
+    critical_count  = int((df_final["risk_score"] > critical_risk_threshold).sum())
     confirmed       = int(df_final["confirmed_threat"].sum())
     review          = int(df_final["high_risk_review"].sum())
     ioc             = int(df_final["data_loss_ioc"].sum())
@@ -288,6 +275,6 @@ if __name__ == "__main__":
     # Update both paths to match your most recent run before executing.
     run_daily_inference(
         input_parquet_path="features/live_test_20260516_001301.parquet",
-        model_path="iso_pipeline_v20260516_010900.pkl",
+        model_path="iso_pipeline_v20260516_xxxxxx.pkl",
         output_dir="features/",
     )
