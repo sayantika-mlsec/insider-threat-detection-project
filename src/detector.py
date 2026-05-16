@@ -62,9 +62,9 @@ class InsiderThreatDetector:
     def __init__(
             self, 
             mad_threshold: float = 3.5, 
-            missing_data_tolerance: float = 0.2,
+            missing_data_tolerance: float = 0.18,
             iso_flag_percentile: float = 1.0,  # Bottom 1% of training score
-            mad_flag_percentile: float = 99.0,
+            mad_flag_percentile: float = 98.0,
             critical_flag_ratio: float | None = None,
     ):
         self.mad_threshold = mad_threshold
@@ -308,11 +308,11 @@ class InsiderThreatDetector:
             self.critical_flag_ratio = 0.15 
             logging.info("[fit_baseline] No training MAD flags. critical_flag_ratio defaulted to 0.15")
         else:
-            # Assuming a 99th percentile target for the tuning
+            # Assuming a 98th percentile target for the tuning
             self.critical_flag_ratio = float(np.nanpercentile(active_ratios, self.mad_flag_percentile))
             logging.info(
                 f"[fit_baseline] Auto-derived critical_flag_ratio = "
-                f"{self.critical_flag_ratio:.4f} (99th percentile of non-zero days)"
+                f"{self.critical_flag_ratio:.4f} (98th percentile of non-zero days)"
             )
         
         # ── 2. Isolation Forest (Model 2) ───────────────────────────────
@@ -368,7 +368,7 @@ class InsiderThreatDetector:
         Scores live traffic against the locked historical baseline.
 
         Returns a DataFrame indexed by (user, activity_date) containing:
-            data_quality_risk     — 1 if >20% of features are NaN
+            data_quality_risk     — 1 if >18% of features are NaN
             mad_score_count       — feature count exceeding MAD threshold
             mad_critical_flag     — 1 if mad_score_count >= 2
             iso_forest_raw_score  — continuous ISO Forest decision_function

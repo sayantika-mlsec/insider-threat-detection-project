@@ -274,7 +274,7 @@ if __name__ == "__main__":
     # model_path         — the .pkl saved by fit_baseline()
     # Update both paths to match your most recent run before executing.
     run_daily_inference(
-        input_parquet_path="features/live_test_20260516_001301.parquet",
-        model_path="iso_pipeline_v20260516_xxxxxx.pkl",
+        input_parquet_path="features/live_test_20260517_025131.parquet",
+        model_path="iso_pipeline_v20260517_025946.pkl",
         output_dir="features/",
     )
