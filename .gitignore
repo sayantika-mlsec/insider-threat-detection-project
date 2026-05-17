@@ -187,3 +187,7 @@ myenv/
 *.pkl
 message.txt
 archive/
+shap_output/
+*.checksum
+check.ipynb
+shap_output_final/
