@@ -73,6 +73,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image
+import os
+import time
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -88,46 +90,20 @@ st.set_page_config(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI ARGUMENT PARSING
+# Grab paths from the environment 
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _parse_args() -> argparse.Namespace:
-    """
-    [DASH-08] Parse file paths from CLI so the dashboard is not hardcoded
-    to any specific directory structure.
-
-    Streamlit passes user CLI args after '--'. Example:
-        streamlit run dashboard.py -- --report path/to/report.parquet
-    """
-    parser = argparse.ArgumentParser(description="SOC Dashboard")
-    parser.add_argument("--report",     required=True, help="Path to soc_alert_report.parquet")
-    parser.add_argument("--detail",     required=True, help="Path to soc_alert_detail.json")
-    parser.add_argument("--plots",      required=True, help="Directory containing SHAP waterfall plots")
-    parser.add_argument("--importance", required=True, help="Path to global_feature_importance.csv")
-
-    # Streamlit injects its own argv entries before '--'. Strip them.
-    try:
-        idx  = sys.argv.index("--")
-        args = parser.parse_args(sys.argv[idx + 1:])
-    except ValueError:
-        # '--' not found — called without custom args (e.g., during unit tests)
-        args = parser.parse_args([
-            "--report",     "shap_output/soc_alert_report.parquet",
-            "--detail",     "shap_output/soc_alert_detail.json",
-            "--plots",      "shap_output/waterfall_plots",
-            "--importance", "shap_output/global_feature_importance.csv",
-        ])
-    return args
-
-
-ARGS = _parse_args()
+REPORT_PATH     = os.getenv("SOC_REPORT_PATH", "shap_output3/soc_alert_report.parquet")
+DETAIL_PATH     = os.getenv("SOC_DETAIL_PATH", "shap_output3/soc_alert_detail.json")
+PLOTS_DIR       = os.getenv("SOC_PLOTS_DIR", "shap_output3/waterfall_plots/")
+IMPORTANCE_PATH = os.getenv("SOC_IMPORTANCE_PATH", "shap_output3/global_feature_importance.csv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADERS — all cached
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data
+#@st.cache_data
 def load_report(path: str) -> pd.DataFrame:
     """
     [DASH-01] Cached parquet load.
@@ -138,18 +114,36 @@ def load_report(path: str) -> pd.DataFrame:
     iso_raw_score: keep as float64 — displayed to 4 decimal places.
     threat categories: keep as int (0/1) — used for filtering and colouring.
     """
+    # --- TRUTH SERUM v3 ---
+    #st.sidebar.error("### 🚨 FILE TRUTH SERUM")
+    #abs_path = Path(path).resolve()
+    #st.sidebar.write("**Absolute Path:**", str(abs_path))
+    #
+    #if abs_path.exists():
+    #    # Foolproof timestamp formatting
+    #    mod_time_str = time.ctime(os.path.getmtime(abs_path))
+    #    st.sidebar.write("**Last Modified:**", mod_time_str)
+    #else:
+    #    st.sidebar.error("FILE DOES NOT EXIST AT THIS PATH!")
+    #st.sidebar.markdown("---")
+    # ----------------------
+
     df = pd.read_parquet(path, engine="pyarrow")
+    # [FIX] Fill NaN scores so the slider doesn't drop Telemetry Gaps
+    if "iso_raw_score" in df.columns:
+        df["iso_raw_score"] = df["iso_raw_score"].fillna(0.0)
 
     # Normalise activity_date to Python date for cleaner display.
     # Must use errors='coerce' + explicit string handling because the parquet
     # may store activity_date as a raw string ("2011-01-03") rather than a
     # timestamp. pd.to_datetime handles both cases; .dt.date strips time component.
     if "activity_date" in df.columns:
+        # Fill missing dates with today's date so they are never dropped
         df["activity_date"] = pd.to_datetime(
             df["activity_date"], errors="coerce"
-        ).dt.date
-        # Drop rows where date parsing failed entirely
-        df = df[df["activity_date"].notna()]
+        ).fillna(pd.Timestamp("today")).dt.date
+        
+    # The .notna() line has been completely removed
 
     # Derive boolean flag columns from threat_category string.
     # The SOC report parquet stores threat_category as a string
@@ -157,9 +151,11 @@ def load_report(path: str) -> pd.DataFrame:
     # separate boolean columns. The sidebar filter and colour coding
     # both depend on boolean columns — derive them here.
     if "threat_category" in df.columns:
-        df["confirmed_threat"]  = df["threat_category"] == "confirmed_threat"
-        df["high_risk_review"]  = df["threat_category"] == "high_risk_review"
-        df["telemetry_gap_flag"]= df["threat_category"].isin(["review", "telemetry_gap_flag"])
+        # Force string conversion and strip whitespace
+        clean_cat = df["threat_category"].astype(str).str.strip()
+        df["confirmed_threat"]   = clean_cat == "confirmed_threat"
+        df["high_risk_review"]   = clean_cat == "high_risk_review"
+        df["telemetry_gap_flag"] = clean_cat.isin(["review", "telemetry_gap_flag"])
     else:
         # Fallback: cast existing int columns to bool if present
         for col in ["confirmed_threat", "high_risk_review", "telemetry_gap_flag"]:
@@ -207,25 +203,16 @@ def load_importance(path: str) -> pd.DataFrame:
 THREAT_COLOURS = {
     "confirmed_threat": "#FF4B4B",   # Streamlit red
     "high_risk_review": "#FFA500",   # Orange
-    "telemetry_gap":    "#FFD700",   # Yellow
+    "telemetry_gap_flag":    "#FFD700",   # Yellow       # changed from "telemetry_gap"
 }
 
-def _style_threat_row(row: pd.Series) -> list[str]:
-    """
-    Applies row-level background colour based on threat category.
-    Used with df.style.apply(axis=1).
-
-    WHY per-row colouring:
-    An alert table with no visual hierarchy forces the analyst to read every
-    cell to triage. Red/orange/yellow colouring lets the eye go directly to
-    the highest-severity alerts — this is standard SOC UI practice (Splunk,
-    Sentinel, Chronicle all use it).
-    """
-    if row.get("confirmed_threat", False):
+def _style_threat_row_display(row: pd.Series) -> list[str]:
+    severity = str(row.get("severity", ""))
+    if "CONFIRMED" in severity:
         colour = "background-color: #3d0000; color: #FF4B4B"
-    elif row.get("high_risk_review", False):
+    elif "REVIEW" in severity:
         colour = "background-color: #3d2000; color: #FFA500"
-    elif row.get("telemetry_gap_flag", False):
+    elif "DATA GAP" in severity:
         colour = "background-color: #3d3000; color: #FFD700"
     else:
         colour = ""
@@ -262,14 +249,10 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
     # datetime.date vs string type mismatch that silently excludes all rows
     # when the parquet stores activity_date as a string.
     if "activity_date" in df.columns:
-        # Convert to string for reliable comparison regardless of stored type
         df["activity_date_str"] = df["activity_date"].astype(str)
         all_dates = sorted(df["activity_date_str"].unique())
 
         if len(all_dates) >= 2:
-            min_date_str = all_dates[0]
-            max_date_str = all_dates[-1]
-
             col1, col2 = st.sidebar.columns(2)
             start_date = col1.selectbox("From", all_dates, index=0)
             end_date   = col2.selectbox("To",   all_dates, index=len(all_dates)-1)
@@ -285,7 +268,7 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.markdown("---")
     show_confirmed = st.sidebar.checkbox("🔴 Confirmed Threats", value=True)
     show_review    = st.sidebar.checkbox("🟠 High Risk Review",  value=True)
-    show_gap       = st.sidebar.checkbox("🟡 Telemetry Gaps",    value=False)
+    show_gap       = st.sidebar.checkbox("🟡 Telemetry Gaps",    value=True)
 
     category_mask = pd.Series(False, index=df.index)
     if show_confirmed and "confirmed_threat"  in df.columns:
@@ -304,9 +287,9 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Anomaly score threshold ───────────────────────────────────────────────
     st.sidebar.markdown("---")
-    if "iso_forest_raw_score" in df.columns and len(df) > 0:
-        score_min = float(df["iso_forest_raw_score"].min())
-        score_max = float(df["iso_forest_raw_score"].max())
+    if "iso_raw_score" in df.columns and len(df) > 0:
+        score_min = float(df["iso_raw_score"].min())
+        score_max = float(df["iso_raw_score"].max())
 
         if score_min < score_max:
             score_threshold = st.sidebar.slider(
@@ -316,7 +299,7 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
                 value     = score_max,
                 step      = round((score_max - score_min) / 100, 4),
             )
-            df = df[df["iso_forest_raw_score"] <= score_threshold]
+            df = df[df["iso_raw_score"] <= score_threshold]
 
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Showing **{len(df)}** alerts after filters.")
@@ -355,6 +338,8 @@ def render_kpis(df_filtered: pd.DataFrame, df_full: pd.DataFrame) -> None:
     col3.metric(
         label = "🟡 Telemetry Gaps",
         value = n_gap,
+        delta = f"of {int(df_full['telemetry_gap_flag'].sum()) if 'telemetry_gap_flag' in df_full.columns else '?'} total",
+        delta_color = "inverse",
     )
     col4.metric(
         label = "Total Alerts (filtered)",
@@ -384,25 +369,25 @@ def render_alert_table(df: pd.DataFrame) -> pd.DataFrame | None:
         return None
 
     # Build the display version — add badge column, drop raw flag columns
-    display_cols = ["user", "activity_date", "iso_forest_raw_score", "mad_flag_ratio"]
+    display_cols = ["user", "activity_date", "iso_raw_score", "mad_flag_ratio"]
     display_cols += [c for c in df.columns if c.startswith("top1_") or c.startswith("top2_")]
     display_cols  = [c for c in display_cols if c in df.columns]
 
     df_display = df[display_cols].copy()
     df_display.insert(0, "severity", df.apply(_threat_badge, axis=1))
-    df_display["iso_forest_raw_score"] = df_display["iso_forest_raw_score"].round(4)
+    df_display["iso_raw_score"] = df_display["iso_raw_score"].round(4)
     df_display["mad_flag_ratio"]        = df_display["mad_flag_ratio"].round(3)
 
     # [DASH-03] Row selection via st.dataframe
     event = st.dataframe(
-        df_display,
+        df_display.style.apply(_style_threat_row_display, axis=1),
         use_container_width = True,
         hide_index          = True,
         on_select           = "rerun",
         selection_mode      = "single-row",
         column_config = {
             "severity": st.column_config.TextColumn("Severity", width="small"),
-            "iso_forest_raw_score": st.column_config.NumberColumn(
+            "iso_raw_score": st.column_config.NumberColumn(
                 "ISO Score", format="%.4f", help="Lower = more anomalous"
             ),
             "mad_flag_ratio": st.column_config.NumberColumn(
@@ -549,7 +534,7 @@ def render_detail_panel(
 
         styled = (
             contrib_df.style
-            .applymap(_colour_zscore, subset=["Z-Score"])
+            .map(_colour_zscore, subset=["Z-Score"])
             .format({"SHAP Value": "{:.5f}", "Z-Score": "{:.2f}"})
         )
 
@@ -697,14 +682,15 @@ def main() -> None:
 
     # ── Load data ─────────────────────────────────────────────────────────────
     try:
-        df_full      = load_report(ARGS.report)
-        detail_index = load_detail(ARGS.detail)
-        importance_df= load_importance(ARGS.importance)
+    
+        df_full       = load_report(REPORT_PATH)
+        detail_index  = load_detail(DETAIL_PATH)
+        importance_df = load_importance(IMPORTANCE_PATH)
+
     except FileNotFoundError as e:
         st.error(
             f"Required data file not found: {e}\n\n"
-            f"Run `run_shap_inference()` first to generate the output files, "
-            f"then relaunch the dashboard."
+            f"Check your environment variables or run `run_shap_inference()` first."
         )
         st.stop()
 
@@ -725,7 +711,7 @@ def main() -> None:
         render_detail_panel(
             selected_row = selected,
             detail_index = detail_index,
-            plots_dir    = ARGS.plots,
+            plots_dir    = PLOTS_DIR,
         )
     elif selected is not None and len(selected) > 1:
         st.info("Select a single row to view its SHAP detail.")

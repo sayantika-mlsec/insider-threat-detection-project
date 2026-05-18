@@ -578,10 +578,21 @@ class IsolationForestSHAPExplainer:
         top_contributors = all_contributions[: self.top_n]
 
         # ── Step 6: Determine threat category ─────────────────────────────────
-        if df_scores_row.get("confirmed_threat", 0) == 1:
-            threat_category = "confirmed_threat"
-        elif df_scores_row.get("high_risk_review", 0) == 1:
+        # Safely extract truthiness to handle bools, ints, or strings
+        is_high_risk = df_scores_row.get("high_risk_review", 0) in [1, True, -1, "1", "True"]
+        is_confirmed = df_scores_row.get("confirmed_threat", 0) in [1, True, -1, "1", "True"]
+        is_telem_gap = df_scores_row.get("telemetry_gap_flag", 0) in [1, True, -1, "1", "True"]
+
+        # Evaluate from MOST specific (3 flags) to LEAST specific (1 flag)
+        if is_high_risk:
+            # IF + MAD + DQ
             threat_category = "high_risk_review"
+        elif is_confirmed:
+            # IF + MAD only
+            threat_category = "confirmed_threat"
+        elif is_telem_gap:
+            # DQ only
+            threat_category = "telemetry_gap_flag"
         else:
             threat_category = "review"
 
@@ -671,8 +682,13 @@ class IsolationForestSHAPExplainer:
                 f"found in df_scores: {flag_cols}. "
                 f"Available columns: {list(df_scores.columns)}"
             )
-
-        flagged_mask  = df_scores[available].any(axis=1)
+        # Force a loud failure if a column is missing or misspelled
+        missing = [c for c in flag_cols if c not in df_scores.columns]
+        if missing:
+            raise ValueError(f"Missing expected threat columns in live traffic: {missing}")
+        
+        # 2. Ensure the boolean mask handles specific types safely
+        flagged_mask = df_scores[flag_cols].any(axis=1)
         flagged_index = df_scores[flagged_mask].index
 
         n_flagged = len(flagged_index)
@@ -902,7 +918,7 @@ def run_shap_inference(
         df_scores        = df_scores,
         df_live_features = df_live_features,
         flag_col         = "confirmed_threat",
-        also_explain     = ["high_risk_review"],
+        also_explain     = ["high_risk_review", "telemetry_gap_flag"],
     )
 
     # ── 7. Generate SOC report ────────────────────────────────────────────────
