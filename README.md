@@ -426,7 +426,7 @@ Each alert generates one `.png` waterfall plot with a deterministic filename bas
 
 ## Author
 
-**[Your Name]**  
+**SAYANTIKA**  
 Aspiring ML Engineer | Actively building in Cybersecurity AI  
-[GitHub](https://github.com/[sayantika-mlsec]) . [Hugging Face](https://huggingface.co/[sayantika-mlsec])
+[GitHub](https://github.com/sayantika-mlsec/insider-threat-detection-project.git) . [Hugging Face](https://huggingface.co/spaces/sayantika-mlsec/insider-threat-soc-dashboard)
 
