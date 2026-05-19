@@ -1,0 +1,12 @@
+streamlit==1.57.0
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+shap==0.51.0
+plotly==6.7.0
+joblib==1.5.3
+scipy==1.17.1
+duckdb==1.5.2
+Pillow==12.2.0
+matplotlib==3.10.9
+pyarrow==24.0.0
